@@ -382,7 +382,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
 
         # Start watching engines
         self.running = True
-        self.watcher_thread = threading.Thread(target=self._watch_engines, daemon=True)
+        self.watcher_thread = threading.Thread(target=lambda: asyncio.run(self._watch_engines()), daemon=True)
         self.watcher_thread.start()
         self.prefill_model_labels = prefill_model_labels
         self.decode_model_labels = decode_model_labels
@@ -406,7 +406,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         """
         return pod.metadata.deletion_timestamp is not None
 
-    def _get_engine_sleep_status(self, pod_ip) -> Optional[bool]:
+    async def _get_engine_sleep_status(self, pod_ip) -> Optional[bool]:
         """
         Get the engine sleeping status by querying the engine's
         '/is_sleeping' endpoint.
@@ -423,10 +423,13 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             if VLLM_API_KEY := os.getenv("VLLM_API_KEY"):
                 logger.info("Using vllm server authentication")
                 headers = {"Authorization": f"Bearer {VLLM_API_KEY}"}
-            response = requests.get(url, headers=headers)
-            response.raise_for_status()
-            sleep = response.json()["is_sleeping"]
-            return sleep
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+                    sleep = data["is_sleeping"]
+                    return sleep
         except Exception as e:
             logger.warning(
                 f"Failed to get the sleep status for engine at {url} - sleep status is set to `False`: {e}"
@@ -488,7 +491,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         except client.rest.ApiException as e:
             logger.error(f"Error removing sleeping label: {e}")
 
-    def _get_model_names(self, pod_ip) -> List[str]:
+    async def _get_model_names(self, pod_ip) -> List[str]:
         """
         Get the model names of the serving engine pod by querying the pod's
         '/v1/models' endpoint.
@@ -505,23 +508,63 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             if VLLM_API_KEY := os.getenv("VLLM_API_KEY"):
                 logger.info("Using vllm server authentication")
                 headers = {"Authorization": f"Bearer {VLLM_API_KEY}"}
-            response = requests.get(url, headers=headers)
-            response.raise_for_status()
-            models = response.json()["data"]
+                
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+                    models = data["data"]
 
-            # Collect all model names, including both base models and adapters
-            model_names = []
-            for model in models:
-                model_id = model["id"]
-                model_names.append(model_id)
+                    # Collect all model names, including both base models and adapters
+                    model_names = []
+                    for model in models:
+                        model_id = model["id"]
+                        model_names.append(model_id)
 
-            logger.info(f"Found models on pod {pod_ip}: {model_names}")
-            return model_names
+                    logger.info(f"Found models on pod {pod_ip}: {model_names}")
+                    return model_names
         except Exception as e:
             logger.error(f"Failed to get model names from {url}: {e}")
             return []
 
-    def _get_model_info(self, pod_ip) -> Dict[str, ModelInfo]:
+    async def _get_models_and_info(self, pod_ip) -> tuple[List[str], Dict[str, ModelInfo]]:
+        """
+        Get both model names and detailed model information in a single HTTP call.
+
+        Args:
+            pod_ip: the IP address of the pod
+
+        Returns:
+            Tuple of (model_names_list, model_info_dict)
+        """
+        url = f"http://{pod_ip}:{self.port}/v1/models"
+        try:
+            headers = None
+            if VLLM_API_KEY := os.getenv("VLLM_API_KEY"):
+                logger.info("Using vllm server authentication")
+                headers = {"Authorization": f"Bearer {VLLM_API_KEY}"}
+                
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+                    models = data["data"]
+
+                    # Collect model names and detailed info
+                    model_names = []
+                    model_info = {}
+                    for model in models:
+                        model_id = model["id"]
+                        model_names.append(model_id)
+                        model_info[model_id] = ModelInfo.from_dict(model)
+
+                    logger.info(f"Found models on pod {pod_ip}: {model_names}")
+                    return model_names, model_info
+        except Exception as e:
+            logger.error(f"Failed to get model data from {url}: {e}")
+            return [], {}
+
+    async def _get_model_info(self, pod_ip) -> Dict[str, ModelInfo]:
         """
         Get detailed model information from the serving engine pod.
 
@@ -537,16 +580,19 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             if VLLM_API_KEY := os.getenv("VLLM_API_KEY"):
                 logger.info("Using vllm server authentication")
                 headers = {"Authorization": f"Bearer {VLLM_API_KEY}"}
-            response = requests.get(url, headers=headers)
-            response.raise_for_status()
-            models = response.json()["data"]
-            # Create a dictionary of model information
-            model_info = {}
-            for model in models:
-                model_id = model["id"]
-                model_info[model_id] = ModelInfo.from_dict(model)
+                
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+                    models = data["data"]
+                    # Create a dictionary of model information
+                    model_info = {}
+                    for model in models:
+                        model_id = model["id"]
+                        model_info[model_id] = ModelInfo.from_dict(model)
 
-            return model_info
+                    return model_info
         except Exception as e:
             logger.error(f"Failed to get model info from {url}: {e}")
             return {}
@@ -565,7 +611,8 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             return None
         return pod.metadata.labels.get("model")
 
-    def _watch_engines(self):
+   
+    async def _watch_engines(self):
         # TODO (ApostaC): remove the hard-coded timeouts
 
         while self.running:
@@ -591,10 +638,12 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                     is_pod_ready = is_container_ready and not is_pod_terminating
 
                     if is_pod_ready:
-                        model_names = self._get_model_names(pod_ip)
+                        # Get both model names and info in a single HTTP call
+                        model_names, model_info = await self._get_models_and_info(pod_ip)
                         model_label = self._get_model_label(pod)
                     else:
                         model_names = []
+                        model_info = {}
                         model_label = None
 
                     # Record pod status for debugging
@@ -603,32 +652,31 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                             f"Pod {pod_name} has ready containers but is terminating - marking as unavailable"
                         )
 
-                    self._on_engine_update(
+                    # Process engine updates concurrently to avoid blocking the event loop
+                    asyncio.create_task(self._on_engine_update(
                         pod_name,
                         pod_ip,
                         event_type,
                         is_pod_ready,
                         model_names,
                         model_label,
-                    )
+                        model_info,
+                    ))
             except Exception as e:
                 logger.error(f"K8s watcher error: {e}")
                 time.sleep(0.5)
 
-    def _add_engine(
-        self, engine_name: str, engine_ip: str, model_names: List[str], model_label: str
+    async def _add_engine(
+        self, engine_name: str, engine_ip: str, model_names: List[str], model_label: str, model_info: Dict[str, ModelInfo]
     ):
         logger.info(
             f"Discovered new serving engine {engine_name} at "
             f"{engine_ip}, running models: {model_names}"
         )
 
-        # Get detailed model information
-        model_info = self._get_model_info(engine_ip)
-
-        # Check if engine is enabled with sleep mode and set engine sleep status
+        # Only need to get sleep status now (model_info is already provided)
         if self._check_engine_sleep_mode(engine_name):
-            sleep_status = self._get_engine_sleep_status(engine_ip)
+            sleep_status = await self._get_engine_sleep_status(engine_ip)
         else:
             sleep_status = False
 
@@ -653,7 +701,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         with self.available_engines_lock:
             del self.available_engines[engine_name]
 
-    def _on_engine_update(
+    async def _on_engine_update(
         self,
         engine_name: str,
         engine_ip: Optional[str],
@@ -661,6 +709,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
         is_pod_ready: bool,
         model_names: List[str],
         model_label: Optional[str],
+        model_info: Dict[str, ModelInfo],
     ) -> None:
         if event == "ADDED":
             if engine_ip is None:
@@ -672,7 +721,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
             if not model_names:
                 return
 
-            self._add_engine(engine_name, engine_ip, model_names, model_label)
+            await self._add_engine(engine_name, engine_ip, model_names, model_label, model_info)
 
         elif event == "DELETED":
             if engine_name not in self.available_engines:
@@ -685,7 +734,7 @@ class K8sPodIPServiceDiscovery(ServiceDiscovery):
                 return
 
             if is_pod_ready and model_names:
-                self._add_engine(engine_name, engine_ip, model_names, model_label)
+                await self._add_engine(engine_name, engine_ip, model_names, model_label, model_info)
                 return
 
             if (
