@@ -1,0 +1,43 @@
+servingEngineSpec:
+  strategy:
+    type: Recreate
+  runtimeClassName: ""
+  modelSpec:
+  - name: "llama3-1-orig"
+    repository: "vllm/vllm-openai"
+    tag: "latest"
+    modelURL: "meta-llama/Llama-3.1-8B-Instruct"
+    replicaCount: 2
+    requestCPU: 8
+    requestMemory: "12Gi"
+    requestGPU: 1
+    hf_token:
+      secretName: "hf-token-secret"
+      secretKey: "hf-token-key"
+    env:
+      - name: TORCH_CUDA_ARCH_LIST
+        value: "9.0"
+      - name: OMP_NUM_THREADS
+        value: "8"
+    vllmConfig:
+      v1: 1
+      tensorParallelSize: 1
+      enablePrefixCaching: false
+      gpuMemoryUtilization: 0.8
+      enforceEager: true
+      maxNumSeqs: 32
+      maxModelLen: 4096
+      extraArgs: ["--disable-log-requests"]
+
+
+routerSpec:
+  repository: "git-act-router"  # Use the image we just built
+  imagePullPolicy: "IfNotPresent"
+  strategy:
+    type: Recreate
+  enableRouter: true
+  serviceDiscovery: "k8s"  # This enables K8sPodIPServiceDiscovery
+  routingLogic: "roundrobin"
+  extraArgs:
+    - "--log-level"
+    - "info"
