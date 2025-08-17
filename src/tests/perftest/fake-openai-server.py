@@ -1,170 +1,260 @@
-"""
-Args:
-    --port: Port to run the server on
-    --host: Host to run the server on
-    --max-tokens: maximum number of tokens to generate in the response if max_tokens is not provided in the request
-    --speed: number of tokens per second per request
-"""
-
 import argparse
-import asyncio
 import time
 import uuid
-from typing import Final
+from enum import Enum
+from typing import List, Optional
 
 from fastapi import FastAPI, Request
-from fastapi.responses import Response, StreamingResponse
-from vllm.entrypoints.openai.protocol import (
-    ChatCompletionRequest,
-    ChatCompletionResponseStreamChoice,
-    ChatCompletionStreamResponse,
-    DeltaMessage,
-    UsageInfo,
-)
-
-app = FastAPI()
-GLOBAL_ARGS = None
-MODEL_NAME = "fake_model_name"
-NUM_RUNNING_REQUESTS = 0
+from fastapi.responses import JSONResponse, Response
+from openai.types.chat import ChatCompletion
+from pydantic import BaseModel, Field
+import uvicorn
 
 
-async def generate_fake_response(
-    request_id: str,
-    model_name: str,
-    num_tokens: int,
-    tokens_per_sec: float,
-):
-    async def sleep_to_target(target: float):
-        sleep_time = target - time.time()
-        if sleep_time > 0:
-            await asyncio.sleep(sleep_time)
+class Role(str, Enum):
+    """Role enumeration for chat messages."""
+    SYSTEM = "system"
+    USER = "user"
+    ASSISTANT = "assistant"
 
-    start = time.time()
-    global NUM_RUNNING_REQUESTS
 
-    if GLOBAL_ARGS.ttft > 0:
-        await asyncio.sleep(GLOBAL_ARGS.ttft)
+class Message(BaseModel):
+    """Chat message model."""
+    role: Role
+    content: str
 
-    NUM_RUNNING_REQUESTS += 1
-    created_time = int(time.time())
-    chunk_object_type: Final = "chat.completion.chunk"
 
-    choice_data = ChatCompletionResponseStreamChoice(
-        index=0,
-        delta=DeltaMessage(
-            role="assistant",
-            content="",
-        ),
-        logprobs=None,
-        finish_reason=None,
+class ChatCompletionRequest(BaseModel):
+    """Chat completion request model."""
+    messages: List[Message] = Field(
+        ..., 
+        min_length=1, 
+        description="The conversation messages history, in chronological order."
     )
-    chunk = ChatCompletionStreamResponse(
-        id=request_id,
-        object=chunk_object_type,
-        created=created_time,
-        choices=[choice_data],
-        model=model_name,
+    model: str = Field(..., description="The name of the model to use.")
+    max_tokens: Optional[int] = Field(
+        default=256,
+        description="Maximum number of tokens to generate in the response."
     )
-    data = chunk.model_dump_json(exclude_unset=True)
-    token_batch = 20
+    temperature: Optional[float] = Field(
+        default=1.0,
+        ge=0.0,
+        le=2.0,
+        description="Sampling temperature to use. Higher values make output more random."
+    )
+    user: Optional[str] = Field(
+        default=None,
+        description="Unique identifier for the end-user to help with monitoring or abuse detection."
+    )
+    stream: Optional[bool] = Field(
+        default=False,
+        description="If true, return streamed responses as data-only server-sent events."
+    )
 
-    for i in range(num_tokens):
-        if i % token_batch == 0:
-            await sleep_to_target(start + i / tokens_per_sec)
+    model_config = {
+        "extra": "ignore",
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "model": "fake_model_name",
+                    "messages": [
+                        {"role": "system", "content": "You are a helpful assistant."},
+                        {"role": "user", "content": "Hello, I'm Ifta"},
+                        {
+                            "role": "user",
+                            "content": "What is my name? What is the capital of Bangladesh?",
+                        },
+                    ],
+                    "temperature": 0.7,
+                    "max_tokens": 128,
+                    "n": 1,
+                    "user": "user-123",
+                }
+            ]
+        },
+    }
 
-        text = "Hello "
-        choice_data = ChatCompletionResponseStreamChoice(
-            index=0, delta=DeltaMessage(content=text), logprobs=None, finish_reason=None
+
+class ChatCompletionResponse(ChatCompletion):
+    """Chat completion response model."""
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "id": "8aerio29048q4924ag32352r4",
+                    "created": 1710000000,
+                    "model": "fake_model_name",
+                    "object": "chat.completion",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": (
+                                    "Hello Ifta. It's nice to meet you.\n\n"
+                                    "Your name is Ifta.\n\n"
+                                    "The capital of Bangladesh is Dhaka."
+                                ),
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 25, "completion_tokens": 35, "total_tokens": 60},
+                }
+            ]
+        }
+    }
+
+
+class FakeOpenAIServer:
+    """Fake OpenAI server implementation."""
+    
+    def __init__(self, model_name: str = "fake_model_name", max_tokens: int = 100):
+        self.model_name = model_name
+        self.max_tokens = max_tokens
+        self.num_running_requests = 0
+        self.app = FastAPI()
+        self._setup_routes()
+    
+    def _setup_routes(self):
+        """Setup FastAPI routes."""
+        self.app.post("/v1/chat/completions")(self.chat_completions)
+        self.app.get("/metrics")(self.metrics)
+    
+    def _generate_fake_content(self, messages: List[Message]) -> str:
+        """Generate fake content based on the input messages."""
+        user_messages = [msg for msg in messages if msg.role == Role.USER]
+        if not user_messages:
+            return "Hello! I'm a helpful assistant."
+        
+        last_user_message = user_messages[-1].content.lower()
+        
+        if "name" in last_user_message and "bangladesh" in last_user_message:
+            return "Nice to meet you, Ifta. Your name is Ifta. The capital of Bangladesh is Dhaka."
+        elif "name" in last_user_message:
+            return "Nice to meet you, Ifta. Your name is Ifta."
+        elif "bangladesh" in last_user_message:
+            return "As for the capital of Bangladesh, it's Dhaka."
+        elif "hello" in last_user_message:
+            return "Hello! How can I help you today?"
+        else:
+            return "I understand your question. Let me provide a helpful response."
+    
+    def _generate_response_data(
+        self, 
+        request_id: str, 
+        model_name: str, 
+        messages: List[Message], 
+        max_tokens: int
+    ) -> dict:
+        """Generate response data structure."""
+        start_time = time.time()
+        self.num_running_requests += 1
+        
+        try:
+            content = self._generate_fake_content(messages)
+            
+            # Estimate token counts
+            prompt_tokens = 64
+            completion_tokens = min(30, max_tokens)
+            total_tokens = prompt_tokens + completion_tokens
+            
+            response_data = {
+                "id": request_id,
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "index": 0,
+                        "logprobs": None,
+                        "message": {
+                            "content": content,
+                            "refusal": None,
+                            "role": "assistant",
+                            "annotations": None,
+                            "audio": None,
+                            "function_call": None,
+                            "tool_calls": [],
+                            "reasoning_content": None
+                        },
+                        "stop_reason": None
+                    }
+                ],
+                "created": int(time.time()),
+                "model": model_name,
+                "object": "chat.completion",
+                "service_tier": None,
+                "system_fingerprint": None,
+                "usage": {
+                    "completion_tokens": completion_tokens,
+                    "prompt_tokens": prompt_tokens,
+                    "total_tokens": total_tokens,
+                    "completion_tokens_details": None,
+                    "prompt_tokens_details": None
+                },
+                "prompt_logprobs": None,
+                "kv_transfer_params": None
+            }
+            
+            return response_data
+            
+        finally:
+            self.num_running_requests -= 1
+            elapsed = time.time() - start_time
+            print(f"Finished request with id: {request_id}, elapsed time: {elapsed:.3f}s")
+    
+    async def chat_completions(self, request: ChatCompletionRequest, raw_request: Request) -> JSONResponse:
+        """Handle chat completion requests."""
+        request_id = f"chatcmpl-{uuid.uuid4()}"
+        print(f"Received request with id: {request_id} at {time.time()}")
+        
+        model_name = request.model or self.model_name
+        num_tokens = request.max_tokens or self.max_tokens
+        
+        response_data = self._generate_response_data(
+            request_id, model_name, request.messages, num_tokens
         )
-        chunk = ChatCompletionStreamResponse(
-            id=request_id,
-            object=chunk_object_type,
-            created=created_time,
-            choices=[choice_data],
-            model=model_name,
-        )
-        data = chunk.model_dump_json(exclude_unset=True)
-        yield f"data: {data}\n\n"
+        return JSONResponse(content=response_data)
+    
+    async def metrics(self) -> Response:
+        """Return metrics endpoint."""
+        content = f"""# HELP vllm:num_requests_running Number of requests currently running on GPU.
+                # TYPE vllm:num_requests_running gauge
+                vllm:num_requests_running{{model_name="{self.model_name}"}} {self.num_running_requests}
+                # HELP vllm:num_requests_swapped Number of requests swapped to CPU.
+                # TYPE vllm:num_requests_swapped gauge
+                vllm:num_requests_swapped{{model_name="{self.model_name}"}} 0.0
+                # HELP vllm:num_requests_waiting Number of requests waiting to be processed.
+                # TYPE vllm:num_requests_waiting gauge
+                vllm:num_requests_waiting{{model_name="{self.model_name}"}} 0.0"""
 
-    await sleep_to_target(num_tokens / tokens_per_sec + start)
+        return Response(content=content, media_type="text/plain")
 
-    choice_data = ChatCompletionResponseStreamChoice(
-        index=0,
-        delta=DeltaMessage(
-            content="\n",
-        ),
-        logprobs=None,
-        finish_reason="length",
+
+def parse_args() -> argparse.Namespace:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description="Fake OpenAI server for testing")
+    parser.add_argument("--port", type=int, default=9000, help="Port to run the server on")
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind the server to")
+    parser.add_argument("--max-tokens", type=int, default=100, help="Maximum tokens to generate")
+    parser.add_argument("--speed", type=int, default=100, help="Number of tokens per second per request")
+    return parser.parse_args()
+
+
+def main():
+    """Main entry point."""
+    args = parse_args()
+    # Use static model_name, only use CLI for port, host, max_tokens, speed
+    server = FakeOpenAIServer(
+        model_name="fake_model_name",
+        max_tokens=args.max_tokens
     )
-
-    chunk = ChatCompletionStreamResponse(
-        id=request_id,
-        object=chunk_object_type,
-        created=created_time,
-        choices=[choice_data],
-        model=model_name,
+    # You can access args.speed in your endpoints if needed
+    uvicorn.run(
+        server.app,
+        host=args.host,
+        port=args.port
     )
-
-    chunk.usage = UsageInfo(
-        prompt_tokens=0,
-        completion_tokens=num_tokens,
-        total_tokens=num_tokens,
-    )
-
-    yield f"data: {data}\n\n"
-    yield "data: [DONE]\n\n"
-
-    NUM_RUNNING_REQUESTS -= 1
-    elapsed = time.time() - start
-    thp = num_tokens / elapsed
-    print(
-        f"Finished request with id: {request_id}, elapsed time {elapsed}, throughput {thp}"
-    )
-
-
-@app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest, raw_request: Request):
-    global MODEL_NAME
-    request_id = raw_request.get("x-request-id", f"fake_request_id_{uuid.uuid4()}")
-    print(f"Received request with id: {request_id} at {time.time()}")
-    model_name = MODEL_NAME
-    num_tokens = request.max_tokens if request.max_tokens else 100
-    tokens_per_sec = GLOBAL_ARGS.speed
-    return StreamingResponse(
-        generate_fake_response(request_id, model_name, num_tokens, tokens_per_sec),
-        media_type="text/event-stream",
-    )
-
-
-@app.get("/metrics")
-async def metrics():
-    global NUM_RUNNING_REQUESTS, MODEL_NAME
-    content = f"""# HELP vllm:num_requests_running Number of requests currently running on GPU.
-# TYPE vllm:num_requests_running gauge
-vllm:num_requests_running{{model_name="{MODEL_NAME}"}} {NUM_RUNNING_REQUESTS}
-# HELP vllm:num_requests_swapped Number of requests swapped to CPU.
-# TYPE vllm:num_requests_swapped gauge
-vllm:num_requests_swapped{{model_name="{MODEL_NAME}"}} 0.0
-# HELP vllm:num_requests_waiting Number of requests waiting to be processed.
-# TYPE vllm:num_requests_waiting gauge
-vllm:num_requests_waiting{{model_name="{MODEL_NAME}"}} 0.0"""
-
-    return Response(content=content, media_type="text/plain")
-
-
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=9000)
-    parser.add_argument("--host", type=str, default="0.0.0.0")
-    parser.add_argument("--max-tokens", type=int, default=100)
-    parser.add_argument("--speed", type=int, default=100)
-    parser.add_argument("--ttft", type=float, default=0)
-    args = parser.parse_args()
-    return args
 
 
 if __name__ == "__main__":
-    import uvicorn
-
-    GLOBAL_ARGS = parse_args()
-    uvicorn.run(app, host=GLOBAL_ARGS.host, port=GLOBAL_ARGS.port)
+    main()
