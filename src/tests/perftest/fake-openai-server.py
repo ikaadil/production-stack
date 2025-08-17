@@ -119,6 +119,8 @@ class FakeOpenAIServer:
     def _setup_routes(self):
         """Setup FastAPI routes."""
         self.app.post("/v1/chat/completions")(self.chat_completions)
+        self.app.get("/v1/models")(self.models)
+        self.app.get("/is_sleeping")(self.is_sleeping)
         self.app.get("/metrics")(self.metrics)
     
     def _generate_fake_content(self, messages: List[Message]) -> str:
@@ -215,6 +217,27 @@ class FakeOpenAIServer:
         )
         return JSONResponse(content=response_data)
     
+    async def models(self) -> JSONResponse:
+        """Return available models endpoint."""
+        models_data = {
+            "object": "list",
+            "data": [
+                {
+                    "id": self.model_name,
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "vllm",
+                    "root": None,
+                    "parent": None
+                }
+            ]
+        }
+        return JSONResponse(content=models_data)
+    
+    async def is_sleeping(self) -> JSONResponse:
+        """Return sleeping status endpoint."""
+        return JSONResponse(content={"is_sleeping": False})
+    
     async def metrics(self) -> Response:
         """Return metrics endpoint."""
         content = f"""# HELP vllm:num_requests_running Number of requests currently running on GPU.
@@ -237,15 +260,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind the server to")
     parser.add_argument("--max-tokens", type=int, default=100, help="Maximum tokens to generate")
     parser.add_argument("--speed", type=int, default=100, help="Number of tokens per second per request")
+    parser.add_argument("--model-name", type=str, default="fake_model_name", help="Model name to use for the server")
     return parser.parse_args()
 
 
 def main():
     """Main entry point."""
     args = parse_args()
-    # Use static model_name, only use CLI for port, host, max_tokens, speed
     server = FakeOpenAIServer(
-        model_name="fake_model_name",
+        model_name=args.model_name,
         max_tokens=args.max_tokens
     )
     # You can access args.speed in your endpoints if needed
