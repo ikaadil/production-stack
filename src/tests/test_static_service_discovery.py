@@ -92,7 +92,9 @@ def test_get_unhealthy_endpoint_hashes_when_healthy_and_unhealthy_models_exist_r
 ) -> None:
     unhealthy_model = "bge-m3"
 
-    def mock_is_model_healthy(url: str, model: str, model_type: str) -> bool:
+    def mock_is_model_healthy(
+        url: str, model: str, model_type: str, timeout: int = 10
+    ) -> bool:
         return model != unhealthy_model
 
     monkeypatch.setattr("vllm_router.utils.is_model_healthy", mock_is_model_healthy)
@@ -137,3 +139,36 @@ def test_get_endpoint_info_when_model_endpoint_hash_is_in_unhealthy_endpoint_doe
     )
     assert len(discovery_instance.get_endpoint_info()) == 1
     assert "llama3" in discovery_instance.get_endpoint_info()[0].model_names
+
+
+def test_has_ever_seen_model_when_model_in_models_list_returns_true():
+    discovery_instance = StaticServiceDiscovery(
+        None,
+        ["http://localhost.com"],
+        ["llama3"],
+        None,
+        None,
+        ["chat"],
+        static_backend_health_checks=False,
+        prefill_model_labels=None,
+        decode_model_labels=None,
+    )
+    assert discovery_instance.has_ever_seen_model("llama3") is True
+    assert discovery_instance.has_ever_seen_model("unknown-model") is False
+
+
+def test_has_ever_seen_model_when_model_is_alias_returns_true():
+    discovery_instance = StaticServiceDiscovery(
+        None,
+        ["http://localhost.com"],
+        ["llama3"],
+        {"llama": "llama3"},
+        None,
+        ["chat"],
+        static_backend_health_checks=False,
+        prefill_model_labels=None,
+        decode_model_labels=None,
+    )
+    assert discovery_instance.has_ever_seen_model("llama") is True
+    assert discovery_instance.has_ever_seen_model("llama3") is True
+    assert discovery_instance.has_ever_seen_model("unknown-model") is False

@@ -8,7 +8,15 @@ metadata:
   labels:
     app.kubernetes.io/component: lora-controller
     helm-release-name: {{ .Release.Name }}
+  {{- with .Values.loraController.labels }}
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.loraController.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
+  replicas: {{ .Values.loraController.replicaCount }}
   selector:
     matchLabels:
       app.kubernetes.io/component: lora-controller
@@ -18,6 +26,9 @@ spec:
       labels:
         app.kubernetes.io/component: lora-controller
         helm-release-name: {{ .Release.Name }}
+      {{- with .Values.loraController.podLabels }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with .Values.loraController.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
@@ -30,10 +41,10 @@ spec:
       serviceAccountName: {{ .Release.Name }}-lora-controller
       securityContext:
         {{- toYaml .Values.loraController.podSecurityContext | nindent 8 }}
-      {{- if hasKey $.Values "sharedPvcStorage" }}
+      {{- if $.Values.sharedPvcStorage.enabled }}
       initContainers:
         - name: fix-perms
-          image: busybox:1.37
+          image: "{{ $.Values.sharedPvcStorage.image.repository }}:{{ $.Values.sharedPvcStorage.image.tag }}"
           command: ["sh", "-c", "chown -R 65532:65532 /data/shared-pvc-storage"]
           securityContext:
             runAsUser: 0
@@ -45,7 +56,7 @@ spec:
       {{- end }}
       containers:
         - name: manager
-          image: "{{ .Values.loraController.image.repository }}:{{ .Values.loraController.image.tag | default "latest" }}"
+          image: "{{ .Values.loraController.image.repository }}:{{ .Values.loraController.image.tag }}"
           imagePullPolicy: {{ .Values.loraController.image.pullPolicy }}
           args:
             - --leader-elect
@@ -91,8 +102,10 @@ spec:
               port: 8081
             initialDelaySeconds: 5
             periodSeconds: 10
+          {{- with .Values.loraController.resources }}
           resources:
-            {{- toYaml .Values.loraController.resources | nindent 12 }}
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           securityContext:
             {{- toYaml .Values.loraController.containerSecurityContext | nindent 12 }}
           volumeMounts:
@@ -101,7 +114,7 @@ spec:
               mountPath: /tmp/k8s-webhook-server/serving-certs
               readOnly: true
           {{- end }}
-          {{- if hasKey $.Values "sharedPvcStorage" }}
+          {{- if .Values.sharedPvcStorage.enabled }}
             - name: {{ .Release.Name }}-shared-pvc-storage
               mountPath: /data/shared-pvc-storage
           {{- end }}
@@ -111,7 +124,7 @@ spec:
           secret:
             secretName: {{ .Release.Name }}-lora-controller-webhook-server-cert
       {{- end }}
-      {{- if hasKey $.Values "sharedPvcStorage" }}
+      {{- if .Values.sharedPvcStorage.enabled }}
         - name: {{ .Release.Name }}-shared-pvc-storage
           persistentVolumeClaim:
             claimName: "{{ .Release.Name }}-shared-pvc-storage-claim"

@@ -28,6 +28,7 @@ from requests import JSONDecodeError
 
 from vllm_router.log import init_logger
 from vllm_router.routers.routing_logic import (
+    DisaggregatedPrefillOrchestratedRouter,
     DisaggregatedPrefillRouter,
     KvawareRouter,
     PrefixAwareRouter,
@@ -97,6 +98,127 @@ _HEADERS_TO_STRIP_FROM_RESPONSE = {
 }
 
 
+async def process_external_provider_request(
+    request: Request,
+    endpoint: str,
+    request_json: dict,
+    request_id: str,
+    background_tasks: BackgroundTasks,
+):
+    """
+    Process a request destined for an external provider (e.g., OpenAI, Anthropic).
+
+    This function:
+    1. Looks up the appropriate adapter from the external provider registry
+    2. Calls the adapter's send_request method
+    3. Returns a StreamingResponse or JSONResponse based on the response type
+
+    Args:
+        request (Request): The incoming HTTP request.
+        endpoint (str): The API endpoint (e.g., "/v1/chat/completions").
+        request_json (dict): The already-parsed request body.
+        request_id (str): The unique request identifier.
+        background_tasks (BackgroundTasks): FastAPI background tasks.
+
+    Returns:
+        StreamingResponse or JSONResponse: The response from the external provider.
+    """
+    requested_model = request_json.get("model")
+    is_streaming = request_json.get("stream", False)
+
+    registry = request.app.state.external_provider_registry
+    adapter = registry.lookup_adapter(requested_model)
+    provider_name = registry.get_provider_name(requested_model)
+    canonical_model_id = registry.get_canonical_model_id(requested_model)
+
+    logger.info(
+        f"Routing request {request_id} for model '{requested_model}' "
+        f"to external provider '{provider_name}' (canonical: {canonical_model_id})"
+    )
+
+    # Track incoming request
+    num_incoming_requests_total.labels(model=requested_model).inc()
+
+    try:
+        # Send request to external provider
+        provider_response = await adapter.send_request(
+            endpoint=endpoint, payload=request_json, stream=is_streaming
+        )
+
+        # Build response headers
+        response_headers = {"X-Request-Id": request_id}
+        response_headers.update(
+            {
+                k: v
+                for k, v in provider_response.headers.items()
+                if k.lower() != "content-type"
+            }
+        )
+
+        # Handle streaming response
+        if provider_response.is_stream and provider_response.stream_iterator:
+            media_type = provider_response.headers.get(
+                "content-type", "text/event-stream"
+            )
+
+            async def stream_wrapper():
+                try:
+                    async for chunk in provider_response.stream_iterator:
+                        yield chunk
+                except Exception as e:
+                    logger.error(
+                        f"Error streaming from external provider '{provider_name}': {e}"
+                    )
+                    raise
+
+            return StreamingResponse(
+                stream_wrapper(),
+                status_code=provider_response.status_code,
+                headers=response_headers,
+                media_type=media_type,
+            )
+
+        # Handle standard (non-streaming) response
+        else:
+            return JSONResponse(
+                content=provider_response.body,
+                status_code=provider_response.status_code,
+                headers=response_headers,
+            )
+
+    except Exception as e:
+        logger.error(
+            f"Request {request_id} failed for external provider '{provider_name}': {e}"
+        )
+        # Track error
+        request_errors_total.labels(
+            server=provider_name, model=requested_model, error_type=type(e).__name__
+        ).inc()
+        raise HTTPException(
+            status_code=502,
+            detail=f"External provider '{provider_name}' request failed: {str(e)}",
+        )
+
+
+def _build_backend_request_headers(
+    request: Request, request_id: str, *, include_content_type: bool = True
+) -> dict[str, str]:
+    headers = {}
+    for key, value in request.headers.items():
+        lowered_key = key.lower()
+        if lowered_key in _HOP_BY_HOP_HEADERS:
+            continue
+        if not include_content_type and lowered_key == "content-type":
+            continue
+        if lowered_key == "x-request-id":
+            continue
+        headers[key] = value
+
+    headers["X-Request-Id"] = request_id
+
+    return headers
+
+
 # TODO: (Brian) check if request is json beforehand
 async def process_request(
     request: Request,
@@ -158,7 +280,7 @@ async def process_request(
         request_json = json.loads(body)
         is_streaming = request_json.get("stream", False)
         model_name = request_json.get("model", "unknown")
-    except JSONDecodeError:
+    except (JSONDecodeError, UnicodeDecodeError, ValueError):
         # If we can't parse the body as JSON, assume it's not streaming
         raise HTTPException(status=400, detail="Request body is not JSON parsable.")
 
@@ -167,9 +289,7 @@ async def process_request(
         span.set_attribute("vllm.is_streaming", is_streaming)
 
     # Sanitize the request headers
-    headers = {
-        k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP_HEADERS
-    }
+    headers = _build_backend_request_headers(request, request_id)
 
     # Inject trace context into outgoing headers
     if tracing_active:
@@ -222,7 +342,7 @@ async def process_request(
                     output_tokens_total.labels(
                         server=backend_url, model=model_name
                     ).inc(usage["completion_tokens"])
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
                 logger.debug("Cannot parse response as JSON, skipping token tracking")
 
         # Store in semantic cache if applicable
@@ -267,6 +387,13 @@ async def route_general_request(
     """
     if isinstance(request.app.state.router, DisaggregatedPrefillRouter):
         response = await route_disaggregated_prefill_request(
+            request, endpoint, background_tasks
+        )
+        return response
+
+    # Handle orchestrated disaggregated inference (NxDI pattern)
+    if isinstance(request.app.state.router, DisaggregatedPrefillOrchestratedRouter):
+        response = await route_orchestrated_disaggregated_request(
             request, endpoint, background_tasks
         )
         return response
@@ -344,6 +471,19 @@ async def route_general_request(
         requested_model = aliases[requested_model]
         request_body = replace_model_in_request_body(request_json, requested_model)
         update_content_length(request, request_body)
+
+    # Check if this model should be routed to an external provider
+    registry = getattr(request.app.state, "external_provider_registry", None)
+    if registry is not None and registry.is_external_model(requested_model):
+        try:
+            response = await process_external_provider_request(
+                request, endpoint, request_json, request_id, background_tasks
+            )
+            end_span(span, status_code=response.status_code) if tracing_active else None
+            return response
+        except Exception as e:
+            end_span(span, error=e, status_code=502) if tracing_active else None
+            raise
 
     # Check if model has ever been seen (even if currently scaled to zero)
     model_ever_existed = False
@@ -467,6 +607,7 @@ async def route_general_request(
             if span is not None:
                 span.set_attribute("vllm.backend_url", server_url)
 
+        media_type = "text/event-stream"
         try:
             stream_generator = process_request(
                 request,
@@ -478,10 +619,12 @@ async def route_general_request(
                 parent_span_context=span_context,
             )
             headers, status = await anext(stream_generator)
+            media_type = headers.get("content-type", "text/event-stream")
             headers_dict = {
                 key: value
                 for key, value in headers.items()
                 if key.lower() not in _HEADERS_TO_STRIP_FROM_RESPONSE
+                and key.lower() != "content-type"
             }
             headers_dict["X-Request-Id"] = request_id
             last_error = None
@@ -514,7 +657,7 @@ async def route_general_request(
         traced_stream(),
         status_code=status,
         headers=headers_dict,
-        media_type="text/event-stream",
+        media_type=media_type,
     )
 
 
@@ -550,6 +693,206 @@ async def send_request_to_decode(
         response.raise_for_status()
         async for chunk in response.content.iter_any():
             yield chunk
+
+
+async def route_orchestrated_disaggregated_request(
+    request: Request,
+    endpoint: str,
+    background_tasks: BackgroundTasks,
+):
+    """
+    Orchestrated disaggregated inference following NxDI's toy_proxy_server pattern.
+
+    Flow (matches NxDI toy_proxy_server.py):
+    1. Send request to Prefill endpoint with kv_transfer_params and max_tokens=1
+    2. Get response containing kv_transfer_params with KV cache metadata
+    3. Extract kv_transfer_params, set remote_host to prefill endpoint
+    4. Forward kv_transfer_params to Decode endpoint
+    5. Stream decode response back to client
+
+    Reference: NxDI/examples/vllm/disaggregated_inference/toy_proxy_server.py
+    """
+    in_router_time = time.time()
+    request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+    request_json = await request.json()
+
+    logger.info(f"[{request_id}] Starting orchestrated disaggregated inference")
+
+    # Get endpoints from service discovery
+    service_discovery = get_service_discovery()
+    endpoints = service_discovery.get_endpoint_info()
+
+    # Use router's _find_endpoints method to get prefill and decode endpoints
+    router = request.app.state.router
+    try:
+        prefiller_endpoints, decoder_endpoints = router._find_endpoints(endpoints)
+    except ValueError as e:
+        logger.error(f"[{request_id}] Endpoint discovery failed: {e}")
+        return JSONResponse(
+            status_code=503,
+            content={"error": str(e)},
+            headers={"X-Request-Id": request_id},
+        )
+
+    # Use round-robin load balancing to select prefill and decode endpoints
+    prefill_endpoint = router.select_prefill_endpoint(prefiller_endpoints)
+    decode_endpoint = router.select_decode_endpoint(decoder_endpoints)
+    prefill_url = prefill_endpoint.url
+    decode_url = decode_endpoint.url
+
+    logger.info(f"[{request_id}] Prefill endpoint: {prefill_url}")
+    logger.info(f"[{request_id}] Decode endpoint: {decode_url}")
+
+    # Step 1: Send to Prefill with max_tokens=1
+    prefill_api_url = f"{prefill_url}{endpoint}"
+    logger.info(f"[{request_id}] Sending prefill request to {prefill_api_url}")
+
+    # Create prefill request with max_tokens=1 to optimize prefill step
+    # Also add kv_transfer_params to enable disaggregated mode on prefill
+    # Reference: NxDI toy_proxy_server.py
+    prefill_request_json = request_json.copy()
+    prefill_request_json["max_tokens"] = 1
+    if "max_completion_tokens" in prefill_request_json:
+        prefill_request_json["max_completion_tokens"] = 1
+    # Enable disaggregated inference mode - prefill will return kv_transfer_params
+    prefill_request_json["kv_transfer_params"] = {
+        "do_remote_decode": True,
+        "do_remote_prefill": False,
+        "remote_engine_id": None,
+        "remote_block_ids": None,
+        "remote_host": None,
+        "remote_port": None,
+    }
+    # Disable streaming for prefill to get full response with kv_transfer_params
+    prefill_request_json["stream"] = False
+    if "stream_options" in prefill_request_json:
+        del prefill_request_json["stream_options"]
+
+    st = time.time()
+    is_streaming = request_json.get("stream", False)
+
+    try:
+        # Use the shared aiohttp client from app state
+        client = request.app.state.aiohttp_client_wrapper()
+
+        # Send to Prefill
+        async with client.post(
+            prefill_api_url,
+            json=prefill_request_json,
+            headers={
+                "Content-Type": "application/json",
+                "X-Request-Id": request_id,
+            },
+            timeout=aiohttp.ClientTimeout(total=300),
+        ) as prefill_resp:
+            if prefill_resp.status != 200:
+                error_text = await prefill_resp.text()
+                logger.error(
+                    f"[{request_id}] Prefill failed with status {prefill_resp.status}: {error_text}"
+                )
+                return JSONResponse(
+                    status_code=prefill_resp.status,
+                    content={"error": f"Prefill failed: {error_text}"},
+                    headers={"X-Request-Id": request_id},
+                )
+
+            prefill_data = await prefill_resp.json()
+            et = time.time()
+            logger.info(f"[{request_id}] Prefill completed in {et - st:.4f}s (TTFT)")
+            logger.debug(
+                f"[{request_id}] Prefill response keys: {prefill_data.keys() if isinstance(prefill_data, dict) else 'not a dict'}"
+            )
+
+        # Step 2: Extract kv_transfer_params and send to Decode
+        # kv_transfer_params is the vLLM/NxDI-supported field for KV cache handoff
+        # Reference: NxDI toy_proxy_server.py
+        decode_request = request_json.copy()
+        kv_transfer_params = prefill_data.get("kv_transfer_params", {})
+        if kv_transfer_params:
+            # Set remote_host to prefill endpoint for KV cache retrieval
+            kv_transfer_params["remote_host"] = prefill_url.split("://")[1].split(":")[
+                0
+            ]
+            decode_request["kv_transfer_params"] = kv_transfer_params
+        else:
+            logger.warning(
+                f"[{request_id}] Prefill response did not contain kv_transfer_params"
+            )
+
+        decode_api_url = f"{decode_url}{endpoint}"
+        logger.info(f"[{request_id}] Sending decode request to {decode_api_url}")
+
+        async with client.post(
+            decode_api_url,
+            json=decode_request,
+            headers={
+                "Content-Type": "application/json",
+                "X-Request-Id": request_id,
+            },
+            timeout=aiohttp.ClientTimeout(total=600),
+        ) as decode_resp:
+            if decode_resp.status != 200:
+                error_text = await decode_resp.text()
+                logger.error(
+                    f"[{request_id}] Decode failed with status {decode_resp.status}: {error_text}"
+                )
+                return JSONResponse(
+                    status_code=decode_resp.status,
+                    content={"error": f"Decode failed: {error_text}"},
+                    headers={"X-Request-Id": request_id},
+                )
+
+            if is_streaming:
+                # For streaming, yield chunks as they arrive (true streaming)
+                async def generate_stream():
+                    try:
+                        async for chunk in decode_resp.content.iter_any():
+                            if chunk:
+                                yield chunk
+                    finally:
+                        curr_time = time.time()
+                        logger.info(
+                            f"[{request_id}] Orchestrated streaming request completed, total time = {curr_time - in_router_time:.4f}s"
+                        )
+
+                return StreamingResponse(
+                    generate_stream(),
+                    media_type="text/event-stream",
+                    headers={"X-Request-Id": request_id},
+                )
+            else:
+                # For non-streaming, read full response
+                response_data = await decode_resp.read()
+
+                curr_time = time.time()
+                logger.info(
+                    f"[{request_id}] Orchestrated request completed, total time = {curr_time - in_router_time:.4f}s"
+                )
+
+                return JSONResponse(
+                    content=json.loads(response_data),
+                    headers={"X-Request-Id": request_id},
+                )
+
+    except aiohttp.ClientError as e:
+        logger.error(
+            f"[{request_id}] HTTP error during orchestrated request: {e}", exc_info=True
+        )
+        return JSONResponse(
+            status_code=503,
+            content={"error": f"HTTP error: {str(e)}"},
+            headers={"X-Request-Id": request_id},
+        )
+    except Exception as e:
+        logger.error(
+            f"[{request_id}] Unexpected error during orchestrated request: {e}",
+            exc_info=True,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Unexpected error: {str(e)}"},
+            headers={"X-Request-Id": request_id},
+        )
 
 
 async def route_disaggregated_prefill_request(
@@ -875,14 +1218,11 @@ async def proxy_multipart_request(
     try:
         client = request.app.state.aiohttp_client_wrapper()
 
-        headers = None
-        if isinstance(form_data, bytes):
-            headers = {
-                k: v
-                for k, v in request.headers.items()
-                if k.lower() not in _HOP_BY_HOP_HEADERS
-            }
-            headers["X-Request-Id"] = request_id
+        headers = _build_backend_request_headers(
+            request,
+            request_id,
+            include_content_type=isinstance(form_data, bytes),
+        )
 
         backend_response = await client.post(
             f"{chosen_url}{endpoint}",

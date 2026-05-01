@@ -9,7 +9,13 @@ servingEngineSpec:
     modelURL: "facebook/opt-125m"
 
     replicaCount: 2
-
+    pdb:
+      enabled: true
+      minAvailable: 1
+      labels:
+        model: "opt125m"
+      annotations:
+        model: "opt125m"
     requestCPU: 6
     requestMemory: "16Gi"
     requestGPU: 0.5
@@ -20,9 +26,10 @@ servingEngineSpec:
 
     vllmConfig:
       maxModelLen: 1024
-      extraArgs: ["--disable-log-requests", "--gpu-memory-utilization", "0.4"]
+      extraArgs: ["--gpu-memory-utilization", "0.4"]
 
 routerSpec:
-  repository: "localhost:5000/git-act-router"
+  repository: "git-act-router"
+  tag: "ci"
   imagePullPolicy: "IfNotPresent"
   enableRouter: true

@@ -23,7 +23,7 @@ import uuid
 from typing import Dict, List, Optional
 
 import requests
-from fastapi import Request
+from fastapi import HTTPException, Request
 
 try:
     from transformers import AutoTokenizer
@@ -55,10 +55,10 @@ class RoutingLogic(str, enum.Enum):
     KVAWARE = "kvaware"
     PREFIXAWARE = "prefixaware"
     DISAGGREGATED_PREFILL = "disaggregated_prefill"
+    DISAGGREGATED_PREFILL_ORCHESTRATED = "disaggregated_prefill_orchestrated"
 
 
 class RoutingInterface(metaclass=SingletonABCMeta):
-
     def _qps_routing(
         self, endpoints: List[EndpointInfo], request_stats: Dict[str, RequestStats]
     ) -> str:
@@ -139,14 +139,31 @@ class RoutingInterface(metaclass=SingletonABCMeta):
 class RoundRobinRouter(RoutingInterface):
     # TODO (ApostaC): when available engines in the endpoints changes, the
     # algorithm may not be "perfectly" round-robin.
+
+    # Upper bound on cached endpoint-set entries to prevent unbounded memory
+    # growth when endpoints change dynamically (add / remove / update).
+    _MAX_CACHE_SIZE = 1024
+
     def __init__(self):
         if hasattr(self, "_initialized"):
             return
-        self.req_id = 0
-        self.sorted_endpoints = []
-        self.last_endpoints_id = None
-        self.last_endpoints_hash = None
+        self._next_index: dict[tuple[str, ...], int] = {}
+        self._sorted_cache: dict[frozenset[str], tuple[str, ...]] = {}
         self._initialized = True
+
+    def _endpoint_key(self, endpoints: List[EndpointInfo]) -> tuple[str, ...]:
+        """Return a stable, sorted key for the endpoint set (cached after first sort)."""
+        if not endpoints:
+            raise ValueError("RoundRobinRouter requires at least one endpoint")
+
+        urls = frozenset(e.url for e in endpoints)
+        key = self._sorted_cache.get(urls)
+        if key is None:
+            if len(self._sorted_cache) >= self._MAX_CACHE_SIZE:
+                self._sorted_cache.clear()
+            key = tuple(sorted(urls))
+            self._sorted_cache[urls] = key
+        return key
 
     def route_request(
         self,
@@ -167,16 +184,15 @@ class RoundRobinRouter(RoutingInterface):
                 indicating the request-level performance of each engine
             request (Request): The incoming request
         """
-        endpoints_id = id(endpoints)
-        if endpoints_id != self.last_endpoints_id:
-            current_hash = hash(tuple(e.url for e in endpoints))
-            if current_hash != self.last_endpoints_hash:
-                self.sorted_endpoints = sorted(endpoints, key=lambda e: e.url)
-                self.last_endpoints_hash = current_hash
-            self.last_endpoints_id = endpoints_id
-        chosen = self.sorted_endpoints[self.req_id % len(self.sorted_endpoints)]
-        self.req_id += 1
-        return chosen.url
+        endpoint_urls = self._endpoint_key(endpoints)
+        idx = self._next_index.get(endpoint_urls, 0)
+        if (
+            len(self._next_index) >= self._MAX_CACHE_SIZE
+            and endpoint_urls not in self._next_index
+        ):
+            self._next_index.clear()
+        self._next_index[endpoint_urls] = idx + 1
+        return endpoint_urls[idx % len(endpoint_urls)]
 
 
 class SessionRouter(RoutingInterface):
@@ -246,16 +262,31 @@ class KvawareRouter(RoutingInterface):
         kv_aware_threshold: int = 2000,
         lmcache_health_check_interval: int = 5,
         lmcache_worker_timeout: int = 30,
+        lmcache_controller_reply_port: Optional[int] = None,
+        lmcache_controller_heartbeat_port: Optional[int] = None,
     ):
         self.lmcache_controller_port = lmcache_controller_port
+        self.lmcache_controller_reply_port = lmcache_controller_reply_port
+        self.lmcache_controller_heartbeat_port = lmcache_controller_heartbeat_port
         logger.info(
-            f"Initializing KvawareRouter with port: {self.lmcache_controller_port}"
+            f"Initializing KvawareRouter with port: {self.lmcache_controller_port}, "
+            f"reply port: {self.lmcache_controller_reply_port}, "
+            f"heartbeat port: {self.lmcache_controller_heartbeat_port}"
         )
+        controller_urls = {
+            "pull": f"0.0.0.0:{self.lmcache_controller_port}",
+            "reply": (
+                f"0.0.0.0:{self.lmcache_controller_reply_port}"
+                if self.lmcache_controller_reply_port is not None
+                else None
+            ),
+        }
+        if self.lmcache_controller_heartbeat_port is not None:
+            controller_urls["heartbeat"] = (
+                f"0.0.0.0:{self.lmcache_controller_heartbeat_port}"
+            )
         self.kv_manager = controller_manager.LMCacheControllerManager(
-            {
-                "pull": f"0.0.0.0:{self.lmcache_controller_port}",
-                "reply": None,
-            },
+            controller_urls,
             health_check_interval=lmcache_health_check_interval,
             lmcache_worker_timeout=lmcache_worker_timeout,
         )
@@ -519,6 +550,114 @@ class DisaggregatedPrefillRouter(RoutingInterface):
             return decoder_endpoints[0].url
 
 
+class DisaggregatedPrefillOrchestratedRouter(RoutingInterface):
+    """
+    Orchestrates disaggregated inference in a single request by chaining Prefill → Decode.
+
+    Unlike DisaggregatedPrefillRouter (which requires 2 separate client requests),
+    this router handles the entire flow internally:
+    1. Receives request from client
+    2. Forwards to Prefill endpoint with kv_transfer_params to enable disaggregated mode
+    3. Gets prefill response with kv_transfer_params containing KV cache metadata
+    4. Extracts kv_transfer_params, sets remote_host, and forwards to Decode
+    5. Streams decode response back to client
+
+    Load balancing: Uses round-robin across available prefill and decode pods.
+    """
+
+    def __init__(self, prefill_model_labels: List[str], decode_model_labels: List[str]):
+        if hasattr(self, "_initialized"):
+            return
+        self.prefill_model_labels = prefill_model_labels or []
+        self.decode_model_labels = decode_model_labels or []
+        # Round-robin counters for load balancing across xPyD pods
+        self.prefill_idx = 0
+        self.decode_idx = 0
+        self._initialized = True
+        logger.info(
+            f"Initialized DisaggregatedPrefillOrchestratedRouter with "
+            f"prefill_labels={self.prefill_model_labels}, "
+            f"decode_labels={self.decode_model_labels}"
+        )
+
+    def _find_endpoints(self, endpoints: List[EndpointInfo]):
+        """Find prefill and decode endpoints based on model labels.
+
+        Raises:
+            HTTPException: 503 if prefill or decode endpoints are not available.
+                - PREFILL_SERVICE_UNAVAILABLE: No prefill endpoints discovered
+                - DECODE_SERVICE_UNAVAILABLE: No decode endpoints discovered
+        """
+        prefiller_endpoints = [
+            e for e in endpoints if e.model_label in self.prefill_model_labels
+        ]
+        decoder_endpoints = [
+            e for e in endpoints if e.model_label in self.decode_model_labels
+        ]
+
+        if not prefiller_endpoints:
+            logger.warning(
+                f"No prefill endpoints found with labels {self.prefill_model_labels}. "
+                f"Available endpoints: {[(e.url, e.model_label) for e in endpoints]}"
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="PREFILL_SERVICE_UNAVAILABLE: No prefill endpoints discovered",
+            )
+        if not decoder_endpoints:
+            logger.warning(
+                f"No decode endpoints found with labels {self.decode_model_labels}. "
+                f"Available endpoints: {[(e.url, e.model_label) for e in endpoints]}"
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="DECODE_SERVICE_UNAVAILABLE: No decode endpoints discovered",
+            )
+
+        return prefiller_endpoints, decoder_endpoints
+
+    def select_prefill_endpoint(
+        self, prefiller_endpoints: List[EndpointInfo]
+    ) -> EndpointInfo:
+        """Select prefill endpoint using round-robin load balancing."""
+        if not prefiller_endpoints:
+            raise ValueError("No prefill endpoints available")
+        # Sort for consistency across requests
+        sorted_endpoints = sorted(prefiller_endpoints, key=lambda e: e.url)
+        selected = sorted_endpoints[self.prefill_idx % len(sorted_endpoints)]
+        self.prefill_idx += 1
+        return selected
+
+    def select_decode_endpoint(
+        self, decoder_endpoints: List[EndpointInfo]
+    ) -> EndpointInfo:
+        """Select decode endpoint using round-robin load balancing."""
+        if not decoder_endpoints:
+            raise ValueError("No decode endpoints available")
+        # Sort for consistency across requests
+        sorted_endpoints = sorted(decoder_endpoints, key=lambda e: e.url)
+        selected = sorted_endpoints[self.decode_idx % len(sorted_endpoints)]
+        self.decode_idx += 1
+        return selected
+
+    async def route_request(
+        self,
+        endpoints: List[EndpointInfo],
+        engine_stats: Dict[str, EngineStats],
+        request_stats: Dict[str, RequestStats],
+        request: Request,
+        request_json: Dict,
+    ) -> str:
+        """
+        This method is called by the router framework but for orchestrated routing,
+        we need to handle the full flow differently. This returns the prefill URL
+        as a placeholder - the actual orchestration happens in route_orchestrated_disaggregated_request.
+        """
+        prefiller_endpoints, _ = self._find_endpoints(endpoints)
+        # Return prefill URL - actual orchestration is done in request.py
+        return prefiller_endpoints[0].url
+
+
 # Instead of managing a global _global_router, we can define the initialization functions as:
 def initialize_routing_logic(
     routing_logic: RoutingLogic, *args, **kwargs
@@ -537,6 +676,10 @@ def initialize_routing_logic(
             kv_aware_threshold=kwargs.get("kv_aware_threshold"),
             lmcache_health_check_interval=kwargs.get("lmcache_health_check_interval"),
             lmcache_worker_timeout=kwargs.get("lmcache_worker_timeout"),
+            lmcache_controller_reply_port=kwargs.get("lmcache_controller_reply_port"),
+            lmcache_controller_heartbeat_port=kwargs.get(
+                "lmcache_controller_heartbeat_port"
+            ),
         )
         router.start_kv_manager()
     elif routing_logic == RoutingLogic.PREFIXAWARE:
@@ -545,6 +688,11 @@ def initialize_routing_logic(
     elif routing_logic == RoutingLogic.DISAGGREGATED_PREFILL:
         logger.info("Initializing disaggregated prefill routing logic")
         router = DisaggregatedPrefillRouter(
+            kwargs.get("prefill_model_labels"), kwargs.get("decode_model_labels")
+        )
+    elif routing_logic == RoutingLogic.DISAGGREGATED_PREFILL_ORCHESTRATED:
+        logger.info("Initializing disaggregated prefill orchestrated routing logic")
+        return DisaggregatedPrefillOrchestratedRouter(
             kwargs.get("prefill_model_labels"), kwargs.get("decode_model_labels")
         )
     else:
@@ -572,6 +720,7 @@ def get_routing_logic() -> RoutingInterface:
         KvawareRouter,
         PrefixAwareRouter,
         DisaggregatedPrefillRouter,
+        DisaggregatedPrefillOrchestratedRouter,
     ):
         if cls in SingletonABCMeta._instances:
             return cls()
@@ -586,6 +735,7 @@ def cleanup_routing_logic():
         KvawareRouter,
         PrefixAwareRouter,
         DisaggregatedPrefillRouter,
+        DisaggregatedPrefillOrchestratedRouter,
     ):
         if cls in SingletonABCMeta._instances:
             instance = cls()

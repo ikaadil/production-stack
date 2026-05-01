@@ -39,6 +39,7 @@ servingEngineSpec:
 
 
 cacheserverSpec:
+  enabled: true
   # -- Number of replicas
   replicaCount: 1
 
@@ -61,9 +62,13 @@ cacheserverSpec:
     requests:
       cpu: "4"
       memory: "8G"
+      # Example extended resource request for InfiniBand/RDMA devices
+      # rdma/ib: "1"
     limits:
       cpu: "4"
       memory: "10G"
+      # Example extended resource limit for InfiniBand/RDMA devices
+      # rdma/ib: "1"
 
   # -- (Optional) Liveness probe for the cache server, available in vllm-openai:latest-nightly
   # livenessProbe:
