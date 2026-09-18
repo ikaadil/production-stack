@@ -23,7 +23,7 @@ import aiohttp
 # --- Request Processing & Routing ---
 from aiohttp import FormData
 from fastapi import BackgroundTasks, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from requests import JSONDecodeError
 
 from vllm_router.log import init_logger
@@ -32,6 +32,7 @@ from vllm_router.routers.routing_logic import (
     DisaggregatedPrefillRouter,
     KvawareRouter,
     PrefixAwareRouter,
+    PriorityRouter,
     SessionRouter,
 )
 from vllm_router.service_discovery import get_service_discovery
@@ -98,6 +99,11 @@ _HEADERS_TO_STRIP_FROM_RESPONSE = {
     "connection",
     "server",
 }
+
+
+def _is_json_media_type(content_type: str) -> bool:
+    media_type = content_type.partition(";")[0].strip().lower()
+    return media_type == "application/json" or media_type.endswith("+json")
 
 
 async def process_external_provider_request(
@@ -415,7 +421,21 @@ async def route_general_request(
     # Same as vllm, Get request_id from X-Request-Id header if available
     request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
     request_body = await request.body()
-    request_json = json.loads(request_body) if request_body else {}
+    try:
+        request_json = json.loads(request_body) if request_body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Invalid request: request body must be valid JSON."},
+            headers={"X-Request-Id": request_id},
+        )
+
+    if not isinstance(request_json, dict):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Invalid request: request body must be a JSON object."},
+            headers={"X-Request-Id": request_id},
+        )
 
     # OpenTelemetry tracing: extract incoming context and create parent span
     span, span_context = None, None
@@ -559,7 +579,8 @@ async def route_general_request(
         )
 
     elif isinstance(
-        request.app.state.router, (KvawareRouter, PrefixAwareRouter, SessionRouter)
+        request.app.state.router,
+        (KvawareRouter, PrefixAwareRouter, SessionRouter, PriorityRouter),
     ):
         server_url = await request.app.state.router.route_request(
             endpoints, engine_stats, request_stats, request, request_json
@@ -568,6 +589,12 @@ async def route_general_request(
         server_url = request.app.state.router.route_request(
             endpoints, engine_stats, request_stats, request
         )
+
+    if isinstance(request.app.state.router, PriorityRouter):
+        # PriorityRouter injects the resolved priority into request_json so
+        # vLLM's own priority scheduler can preempt within the engine.
+        request_body = json.dumps(request_json)
+        update_content_length(request, request_body)
 
     curr_time = time.time()
     # Extract actual session ID from request headers for logging
@@ -607,7 +634,7 @@ async def route_general_request(
                 server_url = remaining[0].url
             elif isinstance(
                 request.app.state.router,
-                (KvawareRouter, PrefixAwareRouter, SessionRouter),
+                (KvawareRouter, PrefixAwareRouter, SessionRouter, PriorityRouter),
             ):
                 server_url = await request.app.state.router.route_request(
                     remaining, engine_stats, request_stats, request, request_json
@@ -1121,6 +1148,8 @@ async def route_general_transcriptions(
 ):
     """Handles audio transcription requests by parsing form data and proxying to backend."""
 
+    request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+
     try:
         form = await request.form()
 
@@ -1132,12 +1161,19 @@ async def route_general_transcriptions(
         temperature: Optional[float] = (
             float(temperature_str) if temperature_str is not None else None
         )
-        language: Optional[str] = form.get("language", "en")
+        language: Optional[str] = form.get("language")
         stream: bool = form.get("stream", "false").lower() == "true"
     except KeyError as e:
         return JSONResponse(
             status_code=400,
             content={"error": f"Invalid request: missing '{e.args[0]}' in form data."},
+            headers={"X-Request-Id": request_id},
+        )
+    except (TypeError, ValueError):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Invalid multipart/form-data request"},
+            headers={"X-Request-Id": request_id},
         )
 
     logger.debug("==== Enter audio_transcriptions ====")
@@ -1155,7 +1191,16 @@ async def route_general_transcriptions(
     payload_bytes = await file.read()
     files = {"file": (file.filename, payload_bytes, file.content_type)}
 
-    data = {"model": model, "language": language}
+    data = {"model": model}
+
+    if isinstance(language, str):
+        language_stripped = language.strip()
+        if language_stripped and language_stripped.lower() not in (
+            "none",
+            "null",
+            "undefined",
+        ):
+            data["language"] = language_stripped
 
     if prompt:
         data["prompt"] = prompt
@@ -1182,12 +1227,12 @@ async def route_general_transcriptions(
     )
 
 
-async def route_image_edit_request(
+async def route_multipart_request(
     request: Request,
     endpoint: str,
     background_tasks: BackgroundTasks,
 ):
-    """Route OpenAI-compatible image edit requests (multipart/form-data)."""
+    """Route OpenAI-compatible multipart/form-data requests."""
 
     body = await request.body()
     try:
@@ -1199,7 +1244,7 @@ async def route_image_edit_request(
             content={"error": "Invalid multipart/form-data request"},
         )
 
-    logger.debug("Routing image edit request with model %s", model)
+    logger.debug("Routing multipart request with model %s", model)
 
     return await proxy_multipart_request(body, model, endpoint, request)
 
@@ -1339,6 +1384,15 @@ async def proxy_multipart_request(
             request_stats_monitor.on_request_response(
                 chosen_url, request_id, time.time()
             )
+            if not _is_json_media_type(
+                backend_response.headers.get("content-type", "")
+            ):
+                return Response(
+                    content=await backend_response.read(),
+                    status_code=backend_response.status,
+                    headers=resp_headers,
+                )
+
             response_content = await backend_response.json()
             return JSONResponse(
                 content=response_content,
