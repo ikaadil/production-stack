@@ -33,6 +33,7 @@ from vllm_router.routers.files_router import files_router
 from vllm_router.routers.main_router import main_router
 from vllm_router.routers.metrics_router import metrics_router
 from vllm_router.routers.routing_logic import (
+    RetryConfig,
     cleanup_routing_logic,
     get_routing_logic,
     initialize_routing_logic,
@@ -269,6 +270,19 @@ def initialize_all(app: FastAPI, args):
 
     if args.callbacks:
         configure_custom_callbacks(args.callbacks, app)
+
+    # Configure retry mechanism (disabled by default for fast failover)
+    if args.enable_retries:
+        app.state.retry_config = RetryConfig(
+            max_retries=args.max_retries,
+            initial_backoff_ms=args.initial_backoff_ms,
+            max_backoff_ms=args.max_backoff_ms,
+            backoff_multiplier=args.backoff_multiplier,
+            jitter_factor=args.jitter_factor,
+        )
+    else:
+        # Disabled: only the initial attempt, so failover alone governs retries
+        app.state.retry_config = RetryConfig(max_retries=1)
 
     initialize_routing_logic(
         args.routing_logic,

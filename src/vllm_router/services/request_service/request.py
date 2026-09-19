@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import json
 import os
 import time
@@ -99,6 +100,26 @@ _HEADERS_TO_STRIP_FROM_RESPONSE = {
     "connection",
     "server",
 }
+
+
+def is_retryable_status(status_code: int) -> bool:
+    """Check if HTTP status code indicates a retryable error.
+
+    Retryable status codes:
+    - 408: Request Timeout
+    - 429: Too Many Requests
+    - 500: Internal Server Error
+    - 502: Bad Gateway
+    - 503: Service Unavailable
+    - 504: Gateway Timeout
+
+    Args:
+        status_code: HTTP status code
+
+    Returns:
+        True if the status code is retryable
+    """
+    return status_code in {408, 429, 500, 502, 503, 504}
 
 
 def _is_json_media_type(content_type: str) -> bool:
@@ -623,13 +644,31 @@ async def route_general_request(
 
     error_urls = set()
     last_error = None
-    max_attempts = request.app.state.router.max_instance_failover_reroute_attempts + 1
+    # Two independent budgets share one loop: instance failover (reroute to a
+    # different engine) and retry-with-backoff (transient status codes, which
+    # may be retried against the same engine). Honour whichever allows more
+    # attempts; retries are opt-in via --enable-retries.
+    retry_config = getattr(request.app.state, "retry_config", None)
+    retry_attempts = retry_config.max_retries if retry_config is not None else 1
+    retries_enabled = retry_attempts > 1
+    failover_attempts = (
+        request.app.state.router.max_instance_failover_reroute_attempts + 1
+    )
+    max_attempts = max(retry_attempts, failover_attempts)
 
     for attempt in range(max_attempts):
         if attempt > 0:
             remaining = [ep for ep in endpoints if ep.url not in error_urls]
             if not remaining:
                 break
+            if retries_enabled:
+                delay = retry_config.calculate_delay(attempt - 1)
+                if delay > 0:
+                    logger.info(
+                        f"Request {request_id} retry attempt {attempt + 1}/{max_attempts}, "
+                        f"waiting {delay:.3f}s before retry"
+                    )
+                    await asyncio.sleep(delay)
             if request_endpoint:
                 server_url = remaining[0].url
             elif isinstance(
@@ -672,7 +711,21 @@ async def route_general_request(
             headers_dict["X-Request-Id"] = request_id
             last_error = None
             break
-        except HTTPException:
+        except HTTPException as e:
+            # A retryable status is a transient backend condition, so the engine
+            # is deliberately NOT added to error_urls: after the backoff it is
+            # still a valid target, which matters for single-engine deployments.
+            if (
+                retries_enabled
+                and is_retryable_status(e.status_code)
+                and attempt + 1 < max_attempts
+            ):
+                last_error = e
+                logger.warning(
+                    f"Request {request_id} got retryable status {e.status_code} from "
+                    f"{server_url}, will retry (attempt {attempt + 1}/{max_attempts})"
+                )
+                continue
             raise
         except Exception as e:
             error_urls.add(server_url)
