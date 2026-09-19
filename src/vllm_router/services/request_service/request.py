@@ -37,6 +37,11 @@ from vllm_router.routers.routing_logic import (
     SessionRouter,
 )
 from vllm_router.service_discovery import get_service_discovery
+from vllm_router.services.request_service.retry import (
+    RETRIES_DISABLED,
+    RetryConfig,
+    RetryState,
+)
 from vllm_router.services.request_service.rewriter import (
     get_request_rewriter,
     is_request_rewriter_initialized,
@@ -100,26 +105,6 @@ _HEADERS_TO_STRIP_FROM_RESPONSE = {
     "connection",
     "server",
 }
-
-
-def is_retryable_status(status_code: int) -> bool:
-    """Check if HTTP status code indicates a retryable error.
-
-    Retryable status codes:
-    - 408: Request Timeout
-    - 429: Too Many Requests
-    - 500: Internal Server Error
-    - 502: Bad Gateway
-    - 503: Service Unavailable
-    - 504: Gateway Timeout
-
-    Args:
-        status_code: HTTP status code
-
-    Returns:
-        True if the status code is retryable
-    """
-    return status_code in {408, 429, 500, 502, 503, 504}
 
 
 def _is_json_media_type(content_type: str) -> bool:
@@ -339,6 +324,8 @@ async def process_request(
             timeout=aiohttp.ClientTimeout(total=None),
         ) as backend_response:
             http_status_code = backend_response.status
+            if http_status_code >= 400:
+                request_status = "error"
             # Set response status on span if tracing
             if span is not None:
                 span.set_attribute("http.status_code", backend_response.status)
@@ -362,9 +349,6 @@ async def process_request(
         request.app.state.request_stats_monitor.on_request_complete(
             backend_url, request_id, end_time
         )
-
-        if http_status_code is not None and http_status_code >= 400:
-            request_status = "error"
 
         # Track token usage for non-streaming requests
         if not is_streaming and full_response:
@@ -406,6 +390,32 @@ async def process_request(
             server=backend_url, model=model_name, status=request_status
         ).observe(time.time() - start_time)
         end_span(span) if tracing_active else None
+
+
+async def _select_backend(
+    request: Request,
+    candidates: list,
+    engine_stats,
+    request_stats,
+    request_json: dict,
+    request_endpoint,
+) -> str:
+    """Return the URL of the engine to forward to.
+
+    Wraps the router-type dispatch so the initial selection and every retry go
+    through exactly the same path.
+    """
+    if request_endpoint:
+        return candidates[0].url
+
+    router = request.app.state.router
+    if isinstance(
+        router, (KvawareRouter, PrefixAwareRouter, SessionRouter, PriorityRouter)
+    ):
+        return await router.route_request(
+            candidates, engine_stats, request_stats, request, request_json
+        )
+    return router.route_request(candidates, engine_stats, request_stats, request)
 
 
 async def route_general_request(
@@ -593,22 +603,12 @@ async def route_general_request(
             )
 
     logger.debug(f"Routing request {request_id} for model: {requested_model}")
+    server_url = await _select_backend(
+        request, endpoints, engine_stats, request_stats, request_json, request_endpoint
+    )
     if request_endpoint:
-        server_url = endpoints[0].url
         logger.debug(
             f"Routing request {request_id} to engine with Id: {endpoints[0].Id}"
-        )
-
-    elif isinstance(
-        request.app.state.router,
-        (KvawareRouter, PrefixAwareRouter, SessionRouter, PriorityRouter),
-    ):
-        server_url = await request.app.state.router.route_request(
-            endpoints, engine_stats, request_stats, request, request_json
-        )
-    else:
-        server_url = request.app.state.router.route_request(
-            endpoints, engine_stats, request_stats, request
         )
 
     if isinstance(request.app.state.router, PriorityRouter):
@@ -642,49 +642,25 @@ async def route_general_request(
             "vllm.routing_logic", type(request.app.state.router).__name__
         )
 
-    error_urls = set()
-    last_error = None
-    # Two independent budgets share one loop: instance failover (reroute to a
-    # different engine) and retry-with-backoff (transient status codes, which
-    # may be retried against the same engine). Honour whichever allows more
-    # attempts; retries are opt-in via --enable-retries.
     retry_config = getattr(request.app.state, "retry_config", None)
-    retry_attempts = retry_config.max_retries if retry_config is not None else 1
-    retries_enabled = retry_attempts > 1
-    failover_attempts = (
-        request.app.state.router.max_instance_failover_reroute_attempts + 1
-    )
-    max_attempts = max(retry_attempts, failover_attempts)
+    if not isinstance(retry_config, RetryConfig):
+        # Missing or unusable configuration degrades to a single attempt.
+        retry_config = RETRIES_DISABLED
+    state = RetryState(retry_config, request_id)
 
-    for attempt in range(max_attempts):
-        if attempt > 0:
-            remaining = [ep for ep in endpoints if ep.url not in error_urls]
-            if not remaining:
-                break
-            if retries_enabled:
-                delay = retry_config.calculate_delay(attempt - 1)
-                if delay > 0:
-                    logger.info(
-                        f"Request {request_id} retry attempt {attempt + 1}/{max_attempts}, "
-                        f"waiting {delay:.3f}s before retry"
-                    )
-                    await asyncio.sleep(delay)
-            if request_endpoint:
-                server_url = remaining[0].url
-            elif isinstance(
-                request.app.state.router,
-                (KvawareRouter, PrefixAwareRouter, SessionRouter, PriorityRouter),
-            ):
-                server_url = await request.app.state.router.route_request(
-                    remaining, engine_stats, request_stats, request, request_json
-                )
-            else:
-                server_url = request.app.state.router.route_request(
-                    remaining, engine_stats, request_stats, request
-                )
+    async for candidates in state.attempts(endpoints):
+        if state.attempt_number > 1:
+            server_url = await _select_backend(
+                request,
+                candidates,
+                engine_stats,
+                request_stats,
+                request_json,
+                request_endpoint,
+            )
             logger.info(
                 f"Routing request {request_id} to {server_url} "
-                f"(attempt {attempt + 1}/{max_attempts})"
+                f"(attempt {state.attempt_number}/{state.max_attempts})"
             )
             if span is not None:
                 span.set_attribute("vllm.backend_url", server_url)
@@ -700,7 +676,15 @@ async def route_general_request(
                 background_tasks,
                 parent_span_context=span_context,
             )
+            # process_request yields the backend status rather than raising on
+            # it, so a retryable status has to be inspected here.
             headers, status = await anext(stream_generator)
+            if state.should_retry_status(status):
+                # Discard this response and free the upstream connection. The
+                # engine is not excluded: it is busy, not broken.
+                await stream_generator.aclose()
+                state.record_transient_status(server_url, status)
+                continue
             media_type = headers.get("content-type", "text/event-stream")
             headers_dict = {
                 key: value
@@ -709,35 +693,20 @@ async def route_general_request(
                 and key.lower() != "content-type"
             }
             headers_dict["X-Request-Id"] = request_id
-            last_error = None
+            state.record_response()
             break
-        except HTTPException as e:
-            # A retryable status is a transient backend condition, so the engine
-            # is deliberately NOT added to error_urls: after the backoff it is
-            # still a valid target, which matters for single-engine deployments.
-            if (
-                retries_enabled
-                and is_retryable_status(e.status_code)
-                and attempt + 1 < max_attempts
-            ):
-                last_error = e
-                logger.warning(
-                    f"Request {request_id} got retryable status {e.status_code} from "
-                    f"{server_url}, will retry (attempt {attempt + 1}/{max_attempts})"
-                )
-                continue
+        except HTTPException:
+            # Only raised for a malformed request, never for a backend status,
+            # so it is a client error and must not be retried.
             raise
-        except Exception as e:
-            error_urls.add(server_url)
-            last_error = e
-            logger.warning(
-                f"Request {request_id} failed on {server_url} "
-                f"(attempt {attempt + 1}/{max_attempts}): {e}"
-            )
+        except Exception as error:
+            state.record_transport_failure(server_url, error)
 
-    if last_error:
-        end_span(span, error=last_error, status_code=500) if tracing_active else None
-        raise last_error
+    if state.last_error:
+        status_code = getattr(state.last_error, "status_code", 500)
+        if tracing_active:
+            end_span(span, error=state.last_error, status_code=status_code)
+        raise state.last_error
 
     # Wrap the generator to end parent span when streaming completes
     async def traced_stream():

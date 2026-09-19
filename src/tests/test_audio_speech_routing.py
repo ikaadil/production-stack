@@ -12,9 +12,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from vllm_router.routers.routing_logic import (
-    RetryConfig,
     RoundRobinRouter,
 )
+from vllm_router.services.request_service.retry import RetryConfig
 from vllm_router.utils import SingletonABCMeta
 
 
@@ -49,7 +49,6 @@ def cleanup_singletons():
 def setup():
     """Yield a (request, router) pair with all app-state dependencies patched."""
     router = RoundRobinRouter()
-    router.max_instance_failover_reroute_attempts = 0
 
     sd = MagicMock()
     sd.get_endpoint_info.return_value = ENDPOINTS
@@ -64,7 +63,7 @@ def setup():
     state.semantic_cache_available = False
     state.callbacks = None
     state.external_provider_registry = None
-    state.retry_config = RetryConfig(max_retries=1)
+    state.retry_config = RetryConfig(max_attempts=1)
 
     req = MagicMock()
     req.headers = {"content-type": "application/json"}

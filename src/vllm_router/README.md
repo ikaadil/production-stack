@@ -63,27 +63,56 @@ The router can be configured using command-line arguments. Below are the availab
 
 ### Retry Configuration
 
-The router supports automatic retry with exponential backoff for transient failures. **Retries are disabled by default** for fast failover behavior.
+A forwarded request can fail in two ways, and the router responds to each differently:
 
-**Retryable Status Codes:** 408, 429, 500, 502, 503, 504
+| Failure | Example | Response |
+| --- | --- | --- |
+| Transport failure | connection refused, timeout | The engine is excluded and the request is rerouted to another engine **immediately** |
+| Retryable status | 408, 429, 500, 502, 503, 504 | The engine stays eligible and the request is re-issued **after a backoff** |
 
-**Important Limitation:** Retries only apply to errors that occur before streaming begins. If an error occurs mid-stream (after the first chunk is sent to the client), the error is passed directly to the client without retry. This is intentional because:
+Both draw on one budget, `--max-retries`. **Retrying is disabled by default**, so a
+request is attempted exactly once unless `--enable-retries` is passed.
 
-- Buffering entire responses would defeat the purpose of streaming
-- HTTP headers have already been sent to the client
-- Clients can implement their own retry logic for incomplete streaming responses
+- `--enable-retries`: Turn on retrying. Disabled by default.
+- `--max-retries`: Maximum total attempts per request, counting the initial one, so 5 means one attempt plus up to four retries. Must be at least 2. Default is 5.
+- `--initial-backoff-ms`: Backoff before the first retry. Default is 50.
+- `--max-backoff-ms`: Upper bound on the backoff. Default is 30000.
+- `--backoff-multiplier`: Growth factor between retries. Default is 1.5.
+- `--jitter-factor`: Randomisation applied to each delay (0.0-1.0). Default is 0.2.
 
-- `--enable-retries`: Enable automatic retry for transient HTTP failures. Disabled by default.
-- `--max-retries`: Maximum total attempts including the initial request. Default is 5 (meaning 1 initial attempt + up to 4 retries). Only used when `--enable-retries` is set.
-- `--initial-backoff-ms`: Initial backoff duration in milliseconds. Default is 50.
-- `--max-backoff-ms`: Maximum backoff duration in milliseconds. Default is 30000.
-- `--backoff-multiplier`: Exponential backoff multiplier. Default is 1.5.
-- `--jitter-factor`: Random jitter factor (0.0-1.0) to prevent thundering herd. Default is 0.2.
+#### Exponential backoff with jitter
 
-Retries are independent of `--max-instance-failover-reroute-attempts`, which rerouts a
-failed request to a *different* engine. A retryable status code is treated as a transient
-condition, so the engine is not blacklisted and may be retried after the backoff. When both
-are configured, the request gets whichever budget allows more attempts.
+```text
+delay  = min(initial_backoff_ms x multiplier ^ retry, max_backoff_ms)
+delay' = delay x (1 + U[-jitter_factor, +jitter_factor])
+```
+
+Jitter is what prevents a [thundering herd](https://medium.com/@avnein4988/mitigating-the-thundering-herd-problem-exponential-backoff-with-jitter-b507cdf90d62):
+without it, every router that backed off from the same incident retries in lockstep and
+re-creates the overload it was backing off from. With the defaults, retries land at
+roughly 50ms, 75ms, 112ms and 169ms, each spread across a +/-20% window.
+
+#### Behaviour worth knowing
+
+- **A retryable status does not blacklist the engine.** A busy engine is not a broken
+  one, so it remains a candidate after the backoff. This is what makes retrying useful
+  on a single-engine deployment.
+- **Failover between healthy engines is never delayed.** The backoff applies only when
+  every engine has been excluded and the pool is given another chance.
+- **The backend response is passed through once the budget is spent** - the client sees
+  the engine's own status and body, not a synthesised router error.
+- **Non-retryable statuses return on the first attempt.** A 400 is the caller's problem
+  and retrying cannot fix it.
+- **Retries only apply before streaming begins.** Once the first chunk has been
+  forwarded the response headers are already with the client, so a mid-stream error is
+  passed through untouched. Buffering whole responses to avoid this would defeat the
+  point of streaming; clients that need more can retry themselves.
+
+> **Replaces `--max-instance-failover-reroute-attempts`.** That flag rerouted a failed
+> request to another engine and is now subsumed by `--max-retries`, which covers the
+> same case and adds backoff. Its default was `0` (a single attempt), which is also the
+> default here, so deployments that never set it are unaffected. Deployments that did
+> set it should pass `--enable-retries --max-retries <previous value + 1>`.
 
 **Example with retry configuration:**
 

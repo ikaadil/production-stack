@@ -20,6 +20,7 @@ from vllm_router.log import init_logger
 from vllm_router.parsers.yaml_utils import (
     read_and_process_yaml_config_file,
 )
+from vllm_router.services.request_service.retry import RetryConfig
 from vllm_router.version import __version__
 
 try:
@@ -120,20 +121,14 @@ def validate_args(args):
         raise ValueError(
             "Sentry profile session sample rate must be between 0.0 and 1.0."
         )
-    if args.max_retries < 1:
+    if args.enable_retries and args.max_retries < 2:
         raise ValueError(
-            "Retry max retries must be at least 1 (1 = no retries, initial attempt only)."
+            "--max-retries counts the initial attempt, so it must be at least 2 "
+            "when --enable-retries is set; 1 would disable retrying."
         )
-    if args.initial_backoff_ms <= 0:
-        raise ValueError("Retry initial backoff must be greater than 0.")
-    if args.max_backoff_ms < args.initial_backoff_ms:
-        raise ValueError(
-            "Retry max backoff must be greater than or equal to initial backoff."
-        )
-    if args.backoff_multiplier < 1.0:
-        raise ValueError("Retry backoff multiplier must be at least 1.0.")
-    if not (0.0 <= args.jitter_factor <= 1.0):
-        raise ValueError("Retry jitter factor must be between 0.0 and 1.0.")
+    # RetryConfig owns the remaining invariants; surface them at startup rather
+    # than on the first request. Ignored entirely when retries are disabled.
+    RetryConfig.from_args(args)
 
 
 def parse_args():
@@ -522,13 +517,6 @@ def parse_args():
         "Only used when --routing-logic=priority.",
     )
 
-    parser.add_argument(
-        "--max-instance-failover-reroute-attempts",
-        type=int,
-        default=0,
-        help="Number of reroute attempts per failed request",
-    )
-
     # Retry configuration arguments
     retry_group = parser.add_argument_group(
         "Retry Configuration",
@@ -537,13 +525,18 @@ def parse_args():
     retry_group.add_argument(
         "--enable-retries",
         action="store_true",
-        help="Enable automatic retry for transient HTTP failures (408, 429, 500, 502, 503, 504). Disabled by default for fast failover.",
+        help="Retry requests that fail with a transient error, using exponential "
+        "backoff with jitter. Covers transport failures (rerouted to another engine) "
+        "and retryable statuses (408, 429, 500, 502, 503, 504). Disabled by default, "
+        "so a request is attempted exactly once.",
     )
     retry_group.add_argument(
         "--max-retries",
         type=int,
         default=5,
-        help="Maximum total attempts including initial request (default: 5). Only used when --enable-retries is set.",
+        help="Maximum total attempts per request, counting the initial one, so 5 "
+        "means one attempt plus up to four retries (default: 5). Only used with "
+        "--enable-retries.",
     )
     retry_group.add_argument(
         "--initial-backoff-ms",
