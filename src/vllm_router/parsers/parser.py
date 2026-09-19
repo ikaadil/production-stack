@@ -126,8 +126,8 @@ def validate_args(args):
             "--max-retries counts the initial attempt, so it must be at least 2 "
             "when --enable-retries is set; 1 would disable retrying."
         )
-    # RetryConfig owns the remaining invariants; surface them at startup rather
-    # than on the first request. Ignored entirely when retries are disabled.
+    # Surface the remaining RetryConfig invariants at startup, not on the
+    # first request.
     RetryConfig.from_args(args)
 
 
@@ -517,7 +517,6 @@ def parse_args():
         "Only used when --routing-logic=priority.",
     )
 
-    # Retry configuration arguments
     retry_group = parser.add_argument_group(
         "Retry Configuration",
         "Configure retry behavior with exponential backoff (disabled by default)",

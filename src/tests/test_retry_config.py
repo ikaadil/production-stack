@@ -96,8 +96,6 @@ class TestBackoff:
 
 
 class TestValidation:
-    """Invalid parameters must fail at construction, not at request time."""
-
     @pytest.mark.parametrize(
         "kwargs, message",
         [

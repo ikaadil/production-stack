@@ -399,11 +399,7 @@ async def _select_backend(
     request_json: dict,
     request_endpoint,
 ) -> str:
-    """Return the URL of the engine to forward to.
-
-    Wraps the router-type dispatch so the initial selection and every retry go
-    through exactly the same path.
-    """
+    """Return the URL of the engine to forward to."""
     if request_endpoint:
         return candidates[0].url
 
@@ -643,7 +639,6 @@ async def route_general_request(
 
     retry_config = getattr(request.app.state, "retry_config", None)
     if not isinstance(retry_config, RetryConfig):
-        # Missing or unusable configuration degrades to a single attempt.
         retry_config = RETRIES_DISABLED
     state = RetryState(retry_config, request_id)
 
@@ -675,12 +670,11 @@ async def route_general_request(
                 background_tasks,
                 parent_span_context=span_context,
             )
-            # process_request yields the backend status rather than raising on
-            # it, so a retryable status has to be inspected here.
+            # process_request yields the backend status rather than raising it.
             headers, status = await anext(stream_generator)
             if state.should_retry_status(status):
-                # Discard this response and free the upstream connection. The
-                # engine is not excluded: it is busy, not broken.
+                # Close to free the upstream connection. The engine is not
+                # excluded: it is busy, not broken.
                 await stream_generator.aclose()
                 state.record_transient_status(server_url, status)
                 continue
@@ -695,8 +689,7 @@ async def route_general_request(
             state.record_response()
             break
         except HTTPException:
-            # Only raised for a malformed request, never for a backend status,
-            # so it is a client error and must not be retried.
+            # Only raised for a malformed request, never for a backend status.
             raise
         except Exception as error:
             state.record_transport_failure(server_url, error)

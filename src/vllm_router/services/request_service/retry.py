@@ -14,29 +14,24 @@
 
 """Retry policy for requests forwarded to a backend engine.
 
-A forwarded request can fail in two distinct ways, and they call for opposite
-responses:
+A forwarded request fails in one of two ways, which call for opposite responses:
 
-* **Transport failure** (connection refused, timeout, ``ClientError``). The
-  engine could not serve the request at all, so it is excluded from selection
-  and the request is rerouted to a different engine immediately -- waiting
-  would only add latency.
-* **Transient response status** (429, 503, ...). The engine is reachable and
-  healthy but cannot take the request right now. It therefore stays eligible,
-  and the request is re-issued after a backoff.
+* **Transport failure** (connection refused, timeout). The engine could not serve
+  the request at all, so it is excluded and the request is rerouted to another
+  engine immediately -- waiting would only add latency.
+* **Retryable status** (408, 429, 500, 502, 503, 504). The engine is reachable
+  but cannot take the request right now, so it stays eligible and the request is
+  re-issued after a backoff.
 
-Backoff is exponential with jitter. Without jitter a fleet of routers that all
-back off from the same incident re-issue their requests in lockstep and
-re-create the overload they were backing off from -- the thundering herd::
+Backoff is exponential with jitter::
 
-    delay   = min(initial_backoff_ms * multiplier ** retry, max_backoff_ms)
+    delay  = min(initial_backoff_ms * multiplier ** retry, max_backoff_ms)
     delay' = delay * (1 + U[-jitter_factor, +jitter_factor])
 
-With the defaults (50ms, x1.5, +/-20%) successive retries land at roughly
-50ms, 75ms, 112ms, 169ms, spread across a +/-20% window.
+Without the jitter, routers that backed off from the same incident retry in
+lockstep and re-create the overload they backed off from.
 
-Retries are opt-in: the default configuration allows a single attempt, which
-is the historical behaviour.
+Retrying is opt-in; the default config allows a single attempt.
 """
 
 from __future__ import annotations
@@ -44,7 +39,7 @@ from __future__ import annotations
 import asyncio
 import random
 from dataclasses import dataclass
-from typing import AsyncIterator, List, Optional, Sequence, TypeVar
+from typing import AsyncIterator, List, Optional, Sequence
 
 from fastapi import HTTPException
 
@@ -52,17 +47,10 @@ from vllm_router.log import init_logger
 
 logger = init_logger(__name__)
 
-# Statuses that indicate a condition the same or another engine may well
-# resolve on its own: a timeout, backpressure, or an unhealthy hop.
 RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
-
-# Endpoint-like objects are only ever read through ``.url`` here, so the policy
-# stays decoupled from service discovery.
-_Endpoint = TypeVar("_Endpoint")
 
 
 def is_retryable_status(status_code: int) -> bool:
-    """Whether ``status_code`` is worth re-issuing the request for."""
     return status_code in RETRYABLE_STATUS_CODES
 
 
@@ -70,10 +58,8 @@ def is_retryable_status(status_code: int) -> bool:
 class RetryConfig:
     """Validated retry parameters.
 
-    ``max_attempts`` counts the initial request, so ``1`` disables retrying
-    and ``5`` permits the initial attempt plus four retries. Invalid
-    combinations raise at construction, which keeps every consumer -- the CLI,
-    tests and programmatic callers -- on the same guarantees.
+    ``max_attempts`` counts the initial request, so ``1`` disables retrying and
+    ``5`` allows the initial attempt plus four retries.
     """
 
     max_attempts: int = 1
@@ -98,11 +84,10 @@ class RetryConfig:
 
     @property
     def enabled(self) -> bool:
-        """Whether more than the initial attempt is permitted."""
         return self.max_attempts > 1
 
     def backoff_seconds(self, retry_index: int) -> float:
-        """Jittered delay before retry number ``retry_index`` (0-based)."""
+        """Jittered delay before retry ``retry_index`` (0-based)."""
         delay_ms = min(
             self.initial_backoff_ms * self.backoff_multiplier**retry_index,
             self.max_backoff_ms,
@@ -116,9 +101,8 @@ class RetryConfig:
     def from_args(cls, args) -> "RetryConfig":
         """Build a config from parsed CLI arguments.
 
-        Without ``--enable-retries`` the remaining flags are ignored entirely,
-        so a shared config template carrying them cannot change behaviour or
-        block startup.
+        Without ``--enable-retries`` the other flags are ignored, so a shared
+        config template carrying them cannot change behaviour or block startup.
         """
         if not getattr(args, "enable_retries", False):
             return cls()
@@ -131,16 +115,14 @@ class RetryConfig:
         )
 
 
-# Shared instance for "retries are not configured"; the config is immutable.
 RETRIES_DISABLED = RetryConfig()
 
 
 class TransientBackendStatus(HTTPException):
-    """Records a retryable backend status as a raisable error.
+    """A retryable backend status, as a raisable error.
 
-    Subclasses :class:`HTTPException` so that, on the rare path where the loop
-    ends without a response to return, the client and the trace both see the
-    backend's own status instead of a generic router 500.
+    Subclasses ``HTTPException`` so that on the paths where the loop ends without
+    a response, the client sees the backend's status rather than a router 500.
     """
 
     def __init__(self, server_url: str, status_code: int) -> None:
@@ -154,9 +136,7 @@ class TransientBackendStatus(HTTPException):
 class RetryState:
     """Per-request bookkeeping across attempts.
 
-    The state machine is deliberately separate from request forwarding: it
-    decides *whether*, *when* and *where* to try next, and knows nothing about
-    HTTP. Callers drive it with :meth:`attempts` and report each outcome.
+    Callers drive it with :meth:`attempts` and report each outcome.
     """
 
     def __init__(self, config: RetryConfig, request_id: str) -> None:
@@ -169,26 +149,17 @@ class RetryState:
         self.last_error: Optional[BaseException] = None
 
     @property
-    def config(self) -> RetryConfig:
-        return self._config
-
-    @property
     def attempt_number(self) -> int:
-        """1-based number of the attempt in flight, for logging."""
+        """1-based, for logging."""
         return self._attempt + 1
 
     @property
     def max_attempts(self) -> int:
         return self._config.max_attempts
 
-    async def attempts(
-        self, endpoints: Sequence[_Endpoint]
-    ) -> AsyncIterator[List[_Endpoint]]:
-        """Yield the endpoints eligible for each attempt, in order.
-
-        Sleeps for the backoff before an attempt that follows a transient
-        failure, and stops once the budget is spent or no engine is left.
-        """
+    async def attempts(self, endpoints: Sequence) -> AsyncIterator[List]:
+        """Yield the endpoints eligible for each attempt, sleeping for the
+        backoff where one is due, until the budget is spent."""
         while self._attempt < self._config.max_attempts:
             if self._attempt == 0:
                 candidates = list(endpoints)
@@ -197,14 +168,8 @@ class RetryState:
                 if not candidates:
                     if not self._config.enabled:
                         return
-                    # Every engine has been excluded by a transport failure.
-                    # Those may well be transient, so rather than failing the
-                    # request, clear the exclusions and give the pool another
-                    # chance once the backoff has elapsed.
-                    logger.debug(
-                        f"Request {self._request_id} exhausted all engines, "
-                        f"retrying the pool after backoff"
-                    )
+                    # Every engine is excluded, but the failures may be
+                    # transient, so retry the pool rather than give up.
                     self._excluded.clear()
                     candidates = list(endpoints)
                     self._backoff_pending = True
@@ -214,11 +179,10 @@ class RetryState:
             self._attempt += 1
 
     def should_retry_status(self, status_code: int) -> bool:
-        """Whether a response with ``status_code`` should be re-issued."""
         return (
             self._config.enabled
             and is_retryable_status(status_code)
-            and self._attempts_remain()
+            and self._attempt + 1 < self._config.max_attempts
         )
 
     def record_transient_status(self, server_url: str, status_code: int) -> None:
@@ -241,13 +205,9 @@ class RetryState:
         )
 
     def record_response(self) -> None:
-        """Note that this attempt produced the response to return."""
         self.last_error = None
 
-    def _attempts_remain(self) -> bool:
-        return self._attempt + 1 < self._config.max_attempts
-
-    def _eligible(self, endpoints: Sequence[_Endpoint]) -> List[_Endpoint]:
+    def _eligible(self, endpoints: Sequence) -> List:
         return [ep for ep in endpoints if ep.url not in self._excluded]
 
     async def _backoff(self) -> None:

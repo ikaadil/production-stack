@@ -31,7 +31,7 @@ ENDPOINTS = [EndpointInfo(url="http://engine1"), EndpointInfo(url="http://engine
 MOCK_HEADERS = MagicMock()
 MOCK_HEADERS.items.return_value = [("content-type", "text/event-stream")]
 
-# Keep the backoff out of the test clock; the delay maths is covered by
+# Keep the backoff out of the test clock; the maths is covered in
 # test_retry_config.py.
 FAST = {"initial_backoff_ms": 1}
 
@@ -148,9 +148,7 @@ def _patch_sleep(recorder):
     return patch.object(retry_module.asyncio, "sleep", fake_sleep)
 
 
-# --------------------------------------------------------------------------
 # Default configuration: exactly one attempt.
-# --------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -190,9 +188,7 @@ async def test_transport_failure_is_not_retried_by_default(setup):
     assert len(calls) == 1
 
 
-# --------------------------------------------------------------------------
 # Transport failures: exclude the engine, reroute immediately.
-# --------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -277,9 +273,7 @@ async def test_single_engine_transport_failure_is_retried():
     assert calls == ["http://engine1", "http://engine1"]
 
 
-# --------------------------------------------------------------------------
 # Transient statuses: keep the engine, back off, re-issue.
-# --------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -383,9 +377,7 @@ async def test_backoff_grows_across_successive_retries(setup):
     assert slept == [0.1, 0.2, 0.4]
 
 
-# --------------------------------------------------------------------------
 # Client errors are never retried.
-# --------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
